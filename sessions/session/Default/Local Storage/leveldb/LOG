@@ -1,6 +1,0 @@
-2026/08/22-22:26:09.394 373c Reusing MANIFEST /home/wayne-alex/Projects/whatsappbot/sessions/session/Default/Local Storage/leveldb/MANIFEST-000001
-2026/08/22-22:26:09.423 373c Recovering log #3
-2026/08/22-22:26:09.430 373c Reusing old log /home/wayne-alex/Projects/whatsappbot/sessions/session/Default/Local Storage/leveldb/000003.log 
-2026/08/22-22:27:09.436 373e Level-0 table #5: started
-2026/08/22-22:27:09.442 373e Level-0 table #5: 19630 bytes OK
-2026/08/22-22:27:09.448 373e Delete type=0 #3
