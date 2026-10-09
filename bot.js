@@ -16,6 +16,12 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// Bypass the ngrok warning screen for all incoming dashboard requests
+app.use((req, res, next) => {
+    res.setHeader('ngrok-skip-browser-warning', 'true');
+    next();
+});
+
 // State
 let client = null;
 let isReady = false;
@@ -501,8 +507,8 @@ function formatSummaryMessage(summary) {
 
 // ==================== START SERVER ====================
 
-app.listen(PORT, () => {
-    console.log(`🚀 WhatsApp Bot Server running on port ${PORT}`);
+app.listen(PORT, '127.0.0.1', () => {
+        console.log(`🚀 WhatsApp Bot Server running on port ${PORT}`);
     console.log(`📍 Health check: http://localhost:${PORT}/status`);
     console.log(`📌 Endpoints:`);
     console.log(`   GET  /status     - Check bot status`);
