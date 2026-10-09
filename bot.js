@@ -34,9 +34,13 @@ const SESSION_DIR = './sessions';
 
 // ==================== HELPERS ====================
 
-/**
- * Safely clear a puppeteer lock file left behind after a crash.
- */
+function ensureSessionDir() {
+    if (!fs.existsSync(SESSION_DIR)) {
+        fs.mkdirSync(SESSION_DIR, { recursive: true });
+        console.log(`📁 Created sessions directory: ${SESSION_DIR}`);
+    }
+}
+
 function clearSessionLock() {
     try {
         const lockFiles = [
@@ -55,19 +59,6 @@ function clearSessionLock() {
     }
 }
 
-/**
- * Ensure sessions directory exists.
- */
-function ensureSessionDir() {
-    if (!fs.existsSync(SESSION_DIR)) {
-        fs.mkdirSync(SESSION_DIR, { recursive: true });
-        console.log(`📁 Created sessions directory: ${SESSION_DIR}`);
-    }
-}
-
-/**
- * Destroy any existing client instance cleanly.
- */
 async function destroyClient() {
     if (!client) return;
     try {
@@ -82,49 +73,119 @@ async function destroyClient() {
 }
 
 /**
- * Safely fetch chats, falling back to contacts if getChats() fails.
+ * Fetch all chats with multiple fallback strategies.
+ *
+ * Strategy 1: client.getChats()            — normal path
+ * Strategy 2: per-chat getChatById loop    — bypasses Promise.all batch failure
+ * Strategy 3: raw puppeteer evaluation     — lowest level, always works
  */
 async function safeGetChats() {
+    // ---- Strategy 1: normal ----
     try {
-        // Primary method
         const chats = await client.getChats();
-        // Filter out any chats that may be broken/undefined
-        return chats.filter((c) => c && c.id && c.id._serialized);
+        const valid = (chats || []).filter((c) => c && c.id && c.id._serialized);
+        if (valid.length > 0) {
+            console.log(`✅ getChats() returned ${valid.length} chats`);
+            return valid;
+        }
+        console.warn('⚠️ getChats() returned 0 valid chats, trying per-chat fallback...');
     } catch (error) {
-        console.warn('⚠️ getChats() failed:', error.message);
-        console.log('🔄 Falling back to getContacts()...');
+        console.error('❌ Strategy 1 (getChats) failed');
+        console.error('   name:', error?.name);
+        console.error('   message:', error?.message);
+        console.error('   stack:', error?.stack);
+    }
 
-        try {
-            const contacts = await client.getContacts();
-            // Build minimal chat-like objects for groups
-            const groupChats = [];
-            for (const contact of contacts) {
-                if (contact.isGroup) {
-                    try {
-                        const chat = await client.getChatById(contact.id._serialized);
-                        if (chat && chat.id) groupChats.push(chat);
-                    } catch (e) {
-                        // Skip broken chats
-                        console.warn(`Skipping broken group ${contact.id._serialized}`);
-                    }
-                }
+    // ---- Strategy 2: get raw chat IDs from puppeteer, resolve one at a time ----
+    try {
+        console.log('🔄 Strategy 2: fetching raw chat IDs from page...');
+        const rawIds = await client.pupPage.evaluate(() => {
+            try {
+                const chats = window.require('WAWebCollections').Chat.getModelsArray();
+                return chats
+                    .map((c) => {
+                        const id = c.id?._serialized || c.id?.$1;
+                        const isGroup = !!(c.groupMetadata || c.isGroup);
+                        return id ? { id, isGroup } : null;
+                    })
+                    .filter(Boolean);
+            } catch (e) {
+                return { error: String(e && e.message ? e.message : e) };
             }
-            return groupChats;
-        } catch (fallbackError) {
-            console.error('❌ Fallback also failed:', fallbackError.message);
+        });
+
+        if (rawIds && rawIds.error) {
+            console.error('❌ Page evaluation error:', rawIds.error);
             return [];
         }
+
+        if (!Array.isArray(rawIds) || rawIds.length === 0) {
+            console.warn('⚠️ Page returned no chat IDs at all');
+            return [];
+        }
+
+        console.log(`📋 Page reported ${rawIds.length} chats (${rawIds.filter((r) => r.isGroup).length} groups)`);
+
+        // Resolve each group one by one, skipping individual failures
+        const resolved = [];
+        for (const raw of rawIds.filter((r) => r.isGroup)) {
+            try {
+                const chat = await client.getChatById(raw.id);
+                if (chat && chat.id && chat.id._serialized) {
+                    resolved.push(chat);
+                }
+            } catch (e) {
+                console.warn(`⚠️ Skipping broken group ${raw.id}: ${e?.message || e}`);
+            }
+        }
+
+        console.log(`✅ Strategy 2 resolved ${resolved.length} groups`);
+        return resolved;
+    } catch (error) {
+        console.error('❌ Strategy 2 (per-chat) failed:', error?.message || error);
+    }
+
+    // ---- Strategy 3: minimal synthetic objects from raw page data ----
+    try {
+        console.log('🔄 Strategy 3: building minimal chat objects from page...');
+        const minimal = await client.pupPage.evaluate(() => {
+            try {
+                const chats = window.require('WAWebCollections').Chat.getModelsArray();
+                return chats
+                    .filter((c) => c.groupMetadata || c.isGroup)
+                    .map((c) => {
+                        const id = c.id?._serialized || c.id?.$1;
+                        if (!id) return null;
+                        return {
+                            id,
+                            name:
+                                c.formattedTitle ||
+                                c.name ||
+                                c.contact?.name ||
+                                c.contact?.pushname ||
+                                'Unnamed Group',
+                            participants: c.groupMetadata?.participants?.length || 0,
+                            isGroup: true,
+                        };
+                    })
+                    .filter(Boolean);
+            } catch (e) {
+                return [];
+            }
+        });
+
+        console.log(`✅ Strategy 3 returned ${minimal.length} groups`);
+        return minimal;
+    } catch (error) {
+        console.error('❌ Strategy 3 failed:', error?.message || error);
+        return [];
     }
 }
 
-/**
- * Resolve a chat by ID, converting @lid to @c.us when needed.
- */
 async function resolveChat(chatId) {
     try {
         return await client.getChatById(chatId);
     } catch (err) {
-        // Try alternate suffix
         if (chatId.endsWith('@lid')) {
             const alt = chatId.replace('@lid', '@c.us');
             console.log(`🔁 Retrying with ${alt}`);
@@ -162,8 +223,6 @@ async function initializeClient() {
 
     try {
         ensureSessionDir();
-
-        // Make sure no previous browser instance is holding the session
         await destroyClient();
         clearSessionLock();
 
@@ -205,7 +264,6 @@ async function initializeClient() {
                 console.error('Failed to generate QR image:', err.message);
                 try {
                     qrCodeBase64 = await QRCode.toDataURL(qr);
-                    console.log('✅ QR Code saved with fallback');
                 } catch (err2) {
                     console.error('Fallback also failed:', err2.message);
                 }
@@ -226,7 +284,6 @@ async function initializeClient() {
             isReady = true;
             isInitializing = false;
             status = 'ready';
-            console.log('📱 Bot is online and ready to send messages!');
         });
 
         // ---------- Auth Failure ----------
@@ -243,7 +300,7 @@ async function initializeClient() {
             isReady = false;
             status = 'disconnected';
             await destroyClient();
-            console.log('🔄 Attempting to reconnect in 30 seconds...');
+            console.log('🔄 Reconnecting in 30 seconds...');
             setTimeout(() => initializeClient(), 30000);
         });
 
@@ -258,13 +315,13 @@ async function initializeClient() {
 
                 if (message.body === '!status') {
                     const chat = await message.getChat();
-                    const statusMsg =
+                    await message.reply(
                         `🤖 *Bot Status*\n\n` +
-                        `✅ Status: Online\n` +
-                        `📱 Connected: Yes\n` +
-                        `👥 Group: ${chat.name || 'N/A'}\n` +
-                        `🕐 ${new Date().toLocaleString()}`;
-                    await message.reply(statusMsg);
+                            `✅ Status: Online\n` +
+                            `📱 Connected: Yes\n` +
+                            `👥 Group: ${chat.name || 'N/A'}\n` +
+                            `🕐 ${new Date().toLocaleString()}`
+                    );
                 }
 
                 if (message.body === '!help') {
@@ -290,25 +347,23 @@ async function initializeClient() {
 
                 if (message.body === '!groups') {
                     if (!isReady) {
-                        await message.reply('❌ Bot is not ready yet. Please wait...');
+                        await message.reply('❌ Bot is not ready yet.');
                         return;
                     }
                     const chats = await safeGetChats();
                     const groups = chats.filter((c) => c.isGroup);
 
-                    let groupMsg = '📋 *Available Groups*\n\n';
+                    let msg = '📋 *Available Groups*\n\n';
                     if (groups.length === 0) {
-                        groupMsg = 'No groups found. Make sure you are in at least one group.';
+                        msg = 'No groups found. Make sure you are in at least one group.';
                     } else {
                         groups.forEach((g, i) => {
-                            groupMsg += `${i + 1}. ${g.name || 'Unnamed'}\n`;
-                            groupMsg += `   ID: ${g.id._serialized}\n`;
-                            groupMsg += `   Members: ${
-                                g.participants ? g.participants.length : 0
-                            }\n\n`;
+                            msg += `${i + 1}. ${g.name || 'Unnamed'}\n`;
+                            msg += `   ID: ${g.id._serialized || g.id}\n`;
+                            msg += `   Members: ${g.participants ? g.participants.length : 0}\n\n`;
                         });
                     }
-                    await message.reply(groupMsg);
+                    await message.reply(msg);
                 }
             } catch (error) {
                 console.error('Error processing message:', error);
@@ -351,27 +406,23 @@ app.get('/qr', async (req, res) => {
                 instructions: 'Scan this QR code with WhatsApp on your phone',
             });
         }
-
         if (qrCodeRaw) {
-            const qrImage = await QRCode.toDataURL(qrCodeRaw, {
+            qrCodeBase64 = await QRCode.toDataURL(qrCodeRaw, {
                 type: 'image/png',
                 margin: 2,
                 scale: 8,
             });
-            qrCodeBase64 = qrImage;
             return res.json({
                 success: true,
-                qr: qrImage,
+                qr: qrCodeBase64,
                 instructions: 'Scan this QR code with WhatsApp on your phone',
             });
         }
-
         res.status(404).json({
             success: false,
             error: 'QR code not available. Check if bot is initialized.',
         });
     } catch (error) {
-        console.error('QR generation error:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to generate QR code: ' + error.message,
@@ -379,7 +430,7 @@ app.get('/qr', async (req, res) => {
     }
 });
 
-// --- Groups (FIXED) ---
+// --- Groups (robust) ---
 app.get('/groups', async (req, res) => {
     try {
         if (!isReady) {
@@ -394,15 +445,17 @@ app.get('/groups', async (req, res) => {
         const groups = chats
             .filter((chat) => chat.isGroup)
             .map((chat) => ({
-                id: chat.id._serialized,
-                name: chat.name || 'Unnamed Group',
-                participants: chat.participants ? chat.participants.length : 0,
+                id: chat.id?._serialized || chat.id,
+                name: chat.name || chat.formattedTitle || 'Unnamed Group',
+                participants: chat.participants
+                    ? chat.participants.length
+                    : chat.groupMetadata?.participants?.length || 0,
                 isGroup: true,
             }));
 
         res.json({ success: true, data: groups });
     } catch (error) {
-        console.error('Groups error:', error);
+        console.error('Groups endpoint error:', error);
         res.status(500).json({
             success: false,
             error: error.message,
@@ -411,24 +464,51 @@ app.get('/groups', async (req, res) => {
     }
 });
 
+// --- Debug: raw chats view ---
+app.get('/debug-chats', async (req, res) => {
+    try {
+        if (!isReady) return res.status(503).json({ error: 'not ready' });
+
+        const raw = await client.pupPage.evaluate(() => {
+            try {
+                const chats = window.require('WAWebCollections').Chat.getModelsArray();
+                return {
+                    count: chats.length,
+                    sample: chats.slice(0, 5).map((c) => ({
+                        hasId: !!c.id,
+                        idSer: c.id?._serialized || null,
+                        id1: c.id?.$1 || null,
+                        hasSerialize: typeof c.serialize === 'function',
+                        isGroup: !!(c.groupMetadata || c.isGroup),
+                        hasLastKey: !!c.lastReceivedKey,
+                    })),
+                };
+            } catch (e) {
+                return { error: String(e?.message || e) };
+            }
+        });
+
+        res.json({ success: true, raw });
+    } catch (err) {
+        res.status(500).json({
+            success: false,
+            name: err?.name,
+            message: err?.message,
+            stack: err?.stack,
+        });
+    }
+});
+
 // --- Send Message ---
 app.post('/send', async (req, res) => {
     try {
         const { groupId, message } = req.body;
-
-        if (!groupId) {
-            return res.status(400).json({ success: false, error: 'Group ID is required' });
-        }
-        if (!message) {
-            return res.status(400).json({ success: false, error: 'Message is required' });
-        }
-        if (!isReady) {
-            return res.status(503).json({ success: false, error: 'WhatsApp client is not ready' });
-        }
+        if (!groupId) return res.status(400).json({ success: false, error: 'Group ID is required' });
+        if (!message) return res.status(400).json({ success: false, error: 'Message is required' });
+        if (!isReady) return res.status(503).json({ success: false, error: 'WhatsApp client is not ready' });
 
         const chat = await resolveChat(groupId);
         await chat.sendMessage(message);
-
         res.json({ success: true, message: 'Message sent successfully' });
     } catch (error) {
         console.error('Send error:', error);
@@ -436,25 +516,17 @@ app.post('/send', async (req, res) => {
     }
 });
 
-// --- Send Entry Notification ---
+// --- Send Entry ---
 app.post('/send-entry', async (req, res) => {
     try {
         const { groupId, entryData } = req.body;
-
-        if (!groupId) {
-            return res.status(400).json({ success: false, error: 'Group ID is required' });
-        }
-        if (!entryData) {
-            return res.status(400).json({ success: false, error: 'Entry data is required' });
-        }
-        if (!isReady) {
-            return res.status(503).json({ success: false, error: 'WhatsApp client is not ready' });
-        }
+        if (!groupId) return res.status(400).json({ success: false, error: 'Group ID is required' });
+        if (!entryData) return res.status(400).json({ success: false, error: 'Entry data is required' });
+        if (!isReady) return res.status(503).json({ success: false, error: 'WhatsApp client is not ready' });
 
         const message = formatEntryMessage(entryData);
         const chat = await resolveChat(groupId);
         await chat.sendMessage(message);
-
         res.json({ success: true, message: 'Entry notification sent successfully' });
     } catch (error) {
         console.error('Send entry error:', error);
@@ -462,25 +534,17 @@ app.post('/send-entry', async (req, res) => {
     }
 });
 
-// --- Send Daily Summary ---
+// --- Send Summary ---
 app.post('/send-summary', async (req, res) => {
     try {
         const { groupId, summaryData } = req.body;
-
-        if (!groupId) {
-            return res.status(400).json({ success: false, error: 'Group ID is required' });
-        }
-        if (!summaryData) {
-            return res.status(400).json({ success: false, error: 'Summary data is required' });
-        }
-        if (!isReady) {
-            return res.status(503).json({ success: false, error: 'WhatsApp client is not ready' });
-        }
+        if (!groupId) return res.status(400).json({ success: false, error: 'Group ID is required' });
+        if (!summaryData) return res.status(400).json({ success: false, error: 'Summary data is required' });
+        if (!isReady) return res.status(503).json({ success: false, error: 'WhatsApp client is not ready' });
 
         const message = formatSummaryMessage(summaryData);
         const chat = await resolveChat(groupId);
         await chat.sendMessage(message);
-
         res.json({ success: true, message: 'Summary sent successfully' });
     } catch (error) {
         console.error('Send summary error:', error);
@@ -496,12 +560,8 @@ app.post('/init', async (req, res) => {
     if (isInitializing) {
         return res.json({ success: true, message: 'Bot initialization already in progress.' });
     }
-
     initializeClient();
-    res.json({
-        success: true,
-        message: 'Bot initialization started. Check /status for progress.',
-    });
+    res.json({ success: true, message: 'Bot initialization started. Check /status for progress.' });
 });
 
 // --- Disconnect ---
@@ -513,7 +573,6 @@ app.post('/disconnect', async (req, res) => {
         qrCodeRaw = null;
         res.json({ success: true, message: 'Bot disconnected successfully' });
     } catch (error) {
-        console.error('Disconnect error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -581,6 +640,7 @@ app.listen(PORT, '127.0.0.1', () => {
     console.log(`   GET  /status       - Check bot status`);
     console.log(`   GET  /qr           - Get QR code`);
     console.log(`   GET  /groups       - List WhatsApp groups`);
+    console.log(`   GET  /debug-chats  - Raw chat info (debug)`);
     console.log(`   POST /init         - Initialize bot`);
     console.log(`   POST /send         - Send message to group`);
     console.log(`   POST /send-entry   - Send entry notification`);
